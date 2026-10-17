@@ -1,0 +1,18 @@
+[Unit]
+Description=annkepull - archive event clips from camera SD cards
+Documentation=file:/opt/annkepull/README.md
+Wants=network-online.target
+After=network-online.target
+Requires=annkepull-storage.service
+After=annkepull-storage.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/annkepull /etc/default/annkepull
+# the first run backfills whole cards, which takes hours
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal

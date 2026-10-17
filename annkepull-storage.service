@@ -1,0 +1,12 @@
+[Unit]
+Description=annkepull - archive storage
+Requires=opt-storage-disk.mount
+After=opt-storage-disk.mount
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

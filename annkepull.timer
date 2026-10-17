@@ -1,0 +1,10 @@
+[Unit]
+Description=annkepull - daily pull of new camera SD-card clips
+
+[Timer]
+OnCalendar=*-*-* 04:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

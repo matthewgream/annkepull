@@ -1,0 +1,240 @@
+#!/usr/bin/env node
+//
+// annkepull -- archive the event clips that Annke cameras record to their own SD cards.
+//
+// The cameras run Hikvision firmware, so their recordings are reachable over ISAPI: a search of track
+// 101 (the main stream) lists every clip on the card with its UTC start/end and a playback URI, and a
+// download of that URI returns the clip in Hikvision's container (an "IMKH" header around MPEG-PS).
+// Each clip is remuxed to mp4 by ffmpeg -- no re-encode -- and stored as
+//
+//     <archive>/<camera>/<YYYYMMDD>/recording_<YYYYMMDDHHMMSS>.mp4      (local start time; mtime = clip start)
+//
+// Every run lists the whole card and fetches whatever is not in the archive yet, oldest first, since
+// a full card overwrites its oldest clips. There is no state file: the archive is the state, so a
+// failed or interrupted run is simply completed by the next one. Clips that ended within `settle`
+// seconds are left for the next run, as the camera may still be writing them.
+//
+// Note: some firmware ends a search at 1000 results, so the card is listed with repeated searches.
+//
+// HTTP goes through curl: ISAPI wants digest auth, and its download call is a GET with an XML body,
+// which fetch() refuses to send.
+//
+// Config: /etc/default/annkepull (key=value).   Usage: annkepull [config] [--dry-run]
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+
+// ------------------------------------------------------------------------------------------ config
+
+const args = process.argv.slice(2);
+const DRY_RUN = args.includes('--dry-run');
+const CFG_FILE = args.find((a) => !a.startsWith('--')) || '/etc/default/annkepull';
+const cfg = {};
+try {
+    for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
+        const m = /^\s*([a-z][a-z0-9-]*)\s*=\s*(.*?)\s*$/.exec(line);
+        if (m) cfg[m[1]] = m[2];
+    }
+} catch (e) {
+    console.error(`annkepull: ${CFG_FILE}: ${e.message}`);
+    process.exit(1);
+}
+const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cfg[k])) ? Number(cfg[k]) : d);
+
+const CAMERAS = Object.entries(cfg)                 // camera-<name>=<host>
+    .filter(([k, v]) => k.startsWith('camera-') && v)
+    .map(([k, v]) => ({ name: k.slice('camera-'.length), host: v }));
+const ARCHIVE = cfg['archive'] || '/opt/storage/camera';
+const USERNAME = cfg['username'] || 'admin';
+const PASSWORD = cfg['password'] || '';
+const SETTLE = num('settle', 600);                  // seconds since a clip ended before it is fetched
+const GIVE_UP = 5;                                  // consecutive failures before a camera is left for the next run
+const BACKOFF = 60;                                 // seconds to pause after a failure, times the failures in a row
+const CARD_START = '2000-01-01T00:00:00Z';          // search from here: "the whole card"
+
+if (!CAMERAS.length) {
+    console.error(`annkepull: ${CFG_FILE}: no camera-<name>=<host> entries`);
+    process.exit(1);
+}
+
+// ------------------------------------------------------------------------------------------ log
+
+const log = (...a) => console.log(...a);            // journald stamps it
+const mb = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+const pad = (n) => String(n).padStart(2, '0');
+const stamp = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+const utc = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+// ------------------------------------------------------------------------------------------ process
+
+function run(cmd, argv, input, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(cmd, argv, { timeout: timeoutMs });
+        let out = '', err = '';
+        child.stdout.setEncoding('utf8').on('data', (d) => (out += d));
+        child.stderr.setEncoding('utf8').on('data', (d) => (err += d));
+        child.on('error', reject);
+        child.on('close', (code, signal) =>
+            code === 0 ? resolve(out) : reject(new Error(err.trim().split('\n').pop() || `${cmd} exited ${code ?? signal}`)));
+        child.stdin.end(input || '');
+    });
+}
+
+// curl takes the credentials on stdin (-K -) so they never show in the process list
+const CURL_AUTH = `user = "${`${USERNAME}:${PASSWORD}`.replace(/[\\"]/g, '\\$&')}"\n`;
+const isapi = (host, urlPath, body, extra, timeoutSec) =>
+    run('curl', ['-sS', '--fail', '--digest', '-K', '-', '--connect-timeout', '10', '-m', String(timeoutSec),
+        '-H', 'Content-Type: application/xml', ...extra, '--data-binary', body, `http://${host}${urlPath}`],
+        CURL_AUTH, (timeoutSec + 15) * 1000);
+
+const tag = (xml, name) => (new RegExp(`<${name}>([^<]*)</${name}>`).exec(xml) || [])[1];
+
+// ------------------------------------------------------------------------------------------ camera
+
+async function search(cam, from, until) {
+    const searchID = crypto.randomUUID(), clips = [];
+    for (let position = 0; ; ) {
+        const xml = await isapi(cam.host, '/ISAPI/ContentMgmt/search',
+            '<?xml version="1.0" encoding="UTF-8"?><CMSearchDescription>' +
+                `<searchID>${searchID}</searchID><trackList><trackID>101</trackID></trackList>` +
+                `<timeSpanList><timeSpan><startTime>${from}</startTime><endTime>${until}</endTime></timeSpan></timeSpanList>` +
+                `<maxResults>50</maxResults><searchResultPostion>${position}</searchResultPostion>` + // sic: Hikvision's spelling
+                '<metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList>' +
+                '</CMSearchDescription>', ['-X', 'POST'], 60);
+        const status = tag(xml, 'responseStatusStrg');
+        if (!status) throw new Error(`search: unexpected reply: ${xml.slice(0, 200)}`);
+        const items = xml.match(/<searchMatchItem>[\s\S]*?<\/searchMatchItem>/g) || [];
+        for (const item of items) {
+            const uri = tag(item, 'playbackURI');   // left XML-escaped: it goes back into the download request as-is
+            clips.push({
+                start: new Date(tag(item, 'startTime')),
+                end: new Date(tag(item, 'endTime')),
+                uri,
+                size: Number((/size=(\d+)/.exec(uri) || [])[1] || 0),
+            });
+        }
+        if (status !== 'MORE' || !items.length) break;
+        position += items.length;
+    }
+    return clips;
+}
+
+// Some firmware (front's V5.7.1 build 230627) ends a search at 1000 results and reports it complete,
+// so search again from the last clip found until a search turns up nothing new.
+async function listClips(cam) {
+    const until = utc(new Date()), clips = new Map();
+    for (let from = CARD_START; ; ) {
+        const found = await search(cam, from, until);
+        let fresh = 0;
+        for (const clip of found)
+            if (!clips.has(clip.uri)) {
+                clips.set(clip.uri, clip);
+                fresh++;
+            }
+        if (!fresh) break;
+        from = utc(new Date(Math.max(...found.map((c) => c.start.getTime()))));
+    }
+    return [...clips.values()].sort((a, b) => a.start - b.start || a.uri.localeCompare(b.uri));
+}
+
+// File names are <YYYYMMDD>/recording_<local start>.mp4. A name already taken earlier in the listing --
+// two clips starting in the same second (the camera splits an event across its storage files), or the
+// hour repeated when DST ends -- gets a _1, _2 ... suffix. The listing is in a fixed order (start, then
+// the card's file name), so a clip gets the same name every run, and is archived if that file exists.
+function names(cam, clips) {
+    const taken = new Map();
+    return clips.map((clip) => {
+        const time = stamp(clip.start), base = `recording_${time}`, n = taken.get(base) || 0;
+        taken.set(base, n + 1);
+        return path.join(ARCHIVE, cam.name, time.slice(0, 8), `${base}${n ? `_${n}` : ''}.mp4`);
+    });
+}
+
+async function fetchClip(cam, clip, file) {
+    const raw = path.join(os.tmpdir(), `annkepull-${cam.name}-${process.pid}.raw`), part = `${file}.part`;
+    try {
+        await isapi(cam.host, '/ISAPI/ContentMgmt/download',
+            `<?xml version="1.0" encoding="UTF-8"?><downloadRequest><playbackURI>${clip.uri}</playbackURI></downloadRequest>`,
+            ['-X', 'GET', '-o', raw], 900);
+        const bytes = fs.statSync(raw).size;
+        if (bytes < clip.size) throw new Error(`short download: ${bytes} of ${clip.size} bytes`);
+        const codec = (await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', raw], '', 60000)).trim();
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        // video copied as-is (hvc1 tag so HEVC also plays in Apple players); audio, if any, is
+        // re-encoded, as the cameras' G.7xx codecs cannot go in mp4
+        await run('ffmpeg', ['-v', 'error', '-y', '-i', raw, '-map', '0:v', '-map', '0:a?', '-c:v', 'copy',
+            ...(codec === 'hevc' ? ['-tag:v', 'hvc1'] : []), '-c:a', 'aac', '-movflags', '+faststart', '-f', 'mp4', part], '', 600000);
+        fs.utimesSync(part, clip.start, clip.start);
+        fs.renameSync(part, file);
+        return bytes;
+    } finally {
+        fs.rmSync(raw, { force: true });
+        fs.rmSync(part, { force: true });
+    }
+}
+
+async function pullCamera(cam) {
+    const root = path.join(ARCHIVE, cam.name);
+    if (!fs.existsSync(root)) throw new Error(`${root} does not exist -- storage not mounted?`);
+    const clips = await listClips(cam), files = names(cam, clips), cutoff = Date.now() - SETTLE * 1000;
+    const tally = { fetched: 0, bytes: 0, archived: 0, settling: 0, failed: 0 };
+    if (clips.length)
+        log(`${cam.name}: ${clips.length} clips on card, ${stamp(clips[0].start).slice(0, 8)} .. ${stamp(clips.at(-1).start).slice(0, 8)}`);
+    let failedInRow = 0;
+    for (const [i, clip] of clips.entries()) {
+        const file = files[i];
+        if (clip.end.getTime() > cutoff) {
+            tally.settling++;
+            continue;
+        }
+        if (fs.existsSync(file)) {
+            tally.archived++;
+            continue;
+        }
+        const name = path.relative(ARCHIVE, file), secs = Math.round((clip.end - clip.start) / 1000);
+        if (DRY_RUN) {
+            log(`${cam.name}: would fetch ${name} (${secs}s, ${mb(clip.size)})`);
+            tally.fetched++;
+            continue;
+        }
+        try {
+            const bytes = await fetchClip(cam, clip, file);
+            log(`${cam.name}: ${name} (${secs}s, ${mb(bytes)})`);
+            tally.fetched++;
+            tally.bytes += bytes;
+            failedInRow = 0;
+        } catch (e) {
+            log(`${cam.name}: ${name} FAILED: ${e.message}`);
+            tally.failed++;
+            if (++failedInRow >= GIVE_UP) {
+                log(`${cam.name}: ${GIVE_UP} failures in a row, leaving the rest for the next run`);
+                break;
+            }
+            // a camera that errors (HTTP 500) usually recovers within minutes: give it time rather than burn the budget
+            await new Promise((resolve) => setTimeout(resolve, failedInRow * BACKOFF * 1000));
+        }
+    }
+    log(`${cam.name}: ${tally.fetched} ${DRY_RUN ? 'to fetch' : `fetched (${mb(tally.bytes)})`}, ${tally.archived} already archived, ` +
+        `${tally.settling} settling, ${tally.failed} failed`);
+    return tally.failed;
+}
+
+// ------------------------------------------------------------------------------------------ main
+
+(async () => {
+    log(`annkepull: ${CAMERAS.map((c) => `${c.name}=${c.host}`).join(' ')} -> ${ARCHIVE}, settle ${SETTLE}s${DRY_RUN ? ', dry run' : ''}`);
+    const results = await Promise.allSettled(CAMERAS.map(pullCamera));
+    let failed = 0;
+    results.forEach((r, i) => {
+        if (r.status === 'fulfilled') failed += r.value;
+        else {
+            failed++;
+            log(`${CAMERAS[i].name}: FAILED: ${r.reason.message}`);
+        }
+    });
+    process.exit(failed ? 1 : 0);
+})();
