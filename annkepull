@@ -15,6 +15,7 @@
 // seconds are left for the next run, as the camera may still be writing them.
 //
 // Note: some firmware ends a search at 1000 results, so the card is listed with repeated searches.
+// Some also reports clip times an hour out after a DST change: see times-<name> in the config.
 //
 // HTTP goes through curl: ISAPI wants digest auth, and its download call is a GET with an XML body,
 // which fetch() refuses to send.
@@ -45,9 +46,10 @@ try {
 }
 const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cfg[k])) ? Number(cfg[k]) : d);
 
-const CAMERAS = Object.entries(cfg)                 // camera-<name>=<host>
+const CAMERAS = Object.entries(cfg)                 // camera-<name>=<host>, times-<name>=utc|current-offset
     .filter(([k, v]) => k.startsWith('camera-') && v)
-    .map(([k, v]) => ({ name: k.slice('camera-'.length), host: v }));
+    .map(([k, v]) => k.slice('camera-'.length))
+    .map((name) => ({ name, host: cfg[`camera-${name}`], currentOffset: cfg[`times-${name}`] === 'current-offset' }));
 const ARCHIVE = cfg['archive'] || '/opt/storage/camera';
 const USERNAME = cfg['username'] || 'admin';
 const PASSWORD = cfg['password'] || '';
@@ -141,6 +143,23 @@ async function listClips(cam) {
     return [...clips.values()].sort((a, b) => a.start - b.start || a.uri.localeCompare(b.uri));
 }
 
+// Some firmware (front's V5.7.1 build 230627) turns a clip's local start into UTC with the camera's offset
+// now, not the one in force when it was recorded, so after a DST change every clip from the other half of
+// the year is reported an hour out (and was re-fetched under a new name, 2026-10-25). For a camera with
+// times-<name>=current-offset, add that offset back to get the camera's clock time, and read it as local
+// time here (this host's zone must be the camera's, as it already must be for the file names).
+async function cameraOffset(cam) {
+    const xml = await isapi(cam.host, '/ISAPI/System/time', '', ['-X', 'GET'], 30);
+    const m = /([+-])(\d\d):(\d\d)$/.exec(tag(xml, 'localTime') || ''); // e.g. 2026-10-25T11:31:57+01:00
+    if (!m) throw new Error(`time: unexpected reply: ${xml.slice(0, 200)}`);
+    return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+}
+
+function fromCameraClock(d, offsetMin) {
+    const t = new Date(d.getTime() + offsetMin * 60000);
+    return new Date(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate(), t.getUTCHours(), t.getUTCMinutes(), t.getUTCSeconds());
+}
+
 // File names are <YYYYMMDD>/recording_<local start>.mp4. A name already taken earlier in the listing --
 // two clips starting in the same second (the camera splits an event across its storage files), or the
 // hour repeated when DST ends -- gets a _1, _2 ... suffix. The listing is in a fixed order (start, then
@@ -180,7 +199,12 @@ async function fetchClip(cam, clip, file) {
 async function pullCamera(cam) {
     const root = path.join(ARCHIVE, cam.name);
     if (!fs.existsSync(root)) throw new Error(`${root} does not exist -- storage not mounted?`);
-    const clips = await listClips(cam), files = names(cam, clips), cutoff = Date.now() - SETTLE * 1000;
+    let clips = await listClips(cam);
+    if (cam.currentOffset) {
+        const offset = await cameraOffset(cam);
+        clips = clips.map((c) => ({ ...c, start: fromCameraClock(c.start, offset), end: fromCameraClock(c.end, offset) }));
+    }
+    const files = names(cam, clips), cutoff = Date.now() - SETTLE * 1000;
     const tally = { fetched: 0, bytes: 0, archived: 0, settling: 0, failed: 0 };
     if (clips.length)
         log(`${cam.name}: ${clips.length} clips on card, ${stamp(clips[0].start).slice(0, 8)} .. ${stamp(clips.at(-1).start).slice(0, 8)}`);

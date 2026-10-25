@@ -47,9 +47,16 @@ short while; a camera that fails 5 downloads in a row is left for the next run.
 
 ## Notes
 
-- The search's `Z` times are real UTC (checked against a known event), not camera local time.
+- The search's `Z` times are real UTC (checked against a known event), not camera local time -- except
+  across a DST change on some firmware, see below.
 - Some firmware (front: V5.7.1 build 230627) ends a search at 1000 results and reports it complete,
   so the card is listed by searching again from the last clip found until nothing new turns up.
+- The same firmware converts clip times to UTC with the camera's offset *now*, not the one when the clip
+  was recorded. So after a DST change every clip from the other half of the year is reported an hour
+  out. On 2026-10-25 that re-fetched front's whole card under names an hour late.
+  `times-<name>=current-offset` in the config undoes it: annkepull reads the camera's current offset
+  (`/ISAPI/System/time`) and adds it back. side (build 220316) reports true UTC. To check a camera,
+  compare a clip's on-screen clock with its file name, in both halves of the year.
 - The download is a GET with a body, which `fetch()` will not send -- hence curl.
 - A camera without an SD card (e.g. `wide`) has nothing to pull; leave it out of the config.
 
