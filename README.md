@@ -1,7 +1,18 @@
 # annkepull
 
-Archives the event clips that Annke cameras record to their own SD cards. Runs daily from a systemd
-timer; each run fetches every clip on each card that is not in the archive yet, so the first run
+One of three tools for an archive of Annke camera clips, each working on what the one before left:
+
+| | |
+|---|---|
+| **annkepull** | fetches the event clips from the cameras' SD cards into the archive, every 6 hours |
+| [annkescan](https://github.com/matthewgream/annkescan) | flags the people, animals and vehicles in each clip, with a daily report to MQTT |
+| [annkeserv](https://github.com/matthewgream/annkeserv) | browses the archive over HTTP, with what annkescan found |
+
+They share nothing but the archive's files (`<archive>/<camera>/<YYYYMMDD>/recording_<...>.mp4`, with
+annkescan's `.json` and `.jpg` beside each clip), so each runs on its own.
+
+Archives the event clips that Annke cameras record to their own SD cards. Runs every 6 hours from a
+systemd timer; each run fetches every clip on each card that is not in the archive yet, so the first run
 backfills whatever the cards still hold and later runs pick up just the new ones.
 
 Clips are stored as `<archive>/<camera>/<YYYYMMDD>/recording_<YYYYMMDDHHMMSS>.mp4` (local start
@@ -13,7 +24,7 @@ gets a `_1` suffix.
 | | |
 |---|---|
 | `annkepull` | the tool (Node, no npm deps; uses `curl`, `ffmpeg`, `ffprobe`) |
-| `annkepull.timer` | runs `annkepull.service` daily at 04:00 (+ up to 30 min), catching up after downtime |
+| `annkepull.timer` | runs `annkepull.service` at 04:00, 10:00, 16:00 and 22:00 (+ up to 30 min), catching up after downtime |
 | `annkepull-storage.service` | gate: the run needs `opt-storage-disk.mount` |
 
 ## Install

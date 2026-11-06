@@ -1,8 +1,8 @@
 [Unit]
-Description=annkepull - daily pull of new camera SD-card clips
+Description=annkepull - pull of new camera SD-card clips, every 6 hours
 
 [Timer]
-OnCalendar=*-*-* 04:00
+OnCalendar=*-*-* 04,10,16,22:00
 RandomizedDelaySec=30m
 Persistent=true
 
