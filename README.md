@@ -5,7 +5,7 @@ One of three tools for an archive of Annke camera clips, each working on what th
 | | |
 |---|---|
 | **annkepull** | fetches the event clips from the cameras' SD cards into the archive, every 6 hours |
-| [annkescan](https://github.com/matthewgream/annkescan) | flags the people, animals and vehicles in each clip, with a daily report to MQTT |
+| [annkescan](https://github.com/matthewgream/annkescan) | flags the people, animals and vehicles in each clip, with a daily report to MQTT; and vehicles at the wide camera, as its stills come |
 | [annkeserv](https://github.com/matthewgream/annkeserv) | browses the archive over HTTP, with what annkescan found |
 
 They share nothing but the archive's files (`<archive>/<camera>/<YYYYMMDD>/recording_<...>.mp4`, with
